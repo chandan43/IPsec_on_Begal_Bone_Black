@@ -41,6 +41,148 @@ static void esp_destroy(struct xfrm_state *x)
 {
 
 }
+//TODO
+static int esp_init_aead(struct xfrm_state *x)
+{
+	char aead_name[CRYPTO_MAX_ALG_NAME];
+	struct crypto_aead *aead;
+	int err;
+
+	err = -ENAMETOOLONG;
+	if (snprintf(aead_name, CRYPTO_MAX_ALG_NAME, "%s(%s)",
+		     x->geniv, x->aead->alg_name) >= CRYPTO_MAX_ALG_NAME)
+		goto error;
+
+	aead = crypto_alloc_aead(aead_name, 0, 0);
+	err = PTR_ERR(aead);
+	if (IS_ERR(aead))
+		goto error;
+	x->data = aead;
+
+	err = crypto_aead_setkey(aead, x->aead->alg_key,
+				 (x->aead->alg_key_len + 7) / 8);
+	if (err)
+		goto error;
+
+	err = crypto_aead_setauthsize(aead, x->aead->alg_icv_len / 8);
+	if (err)
+		goto error;
+
+error:
+	return err;
+}
+/* 
+   Generic structure for encapsulation of optional route information.
+   It is reminiscent of sockaddr, but with sa_family replaced
+   with attribute type.
+ */
+ /* ESN: https://tools.ietf.org/html/rfc4304*/
+ /* crypto_alloc_aead :  Allocate a cipher handle for an AEAD. The returned struct 
+    crypto_aead is the cipher handle that is required for any subsequent 
+    API invocation for that AEAD. */
+ /* allocated cipher handle in case of success; IS_ERR is true in case of 
+    an error, PTR_ERR returns the error code. */
+ /* BUG() and BUG_ON(condition) are used as a debugging help when something 
+    in the kernel goes terribly wrong. When a BUG_ON() assertion fails, or 
+    the code takes a branch with BUG() in it, the kernel will print out the 
+    contents of the registers and a stack trace. After that the current process will die. 
+ */ 
+ /**
+ * crypto_aead_setauthsize() - set authentication data size
+ * @tfm: cipher handle
+ * @authsize: size of the authentication data / tag in bytes
+ *
+ * Set the authentication data size / tag size. AEAD requires an authentication
+ * tag (or MAC) in addition to the associated data.
+ *
+ * Return: 0 if the setting of the key was successful; < 0 if an error occurred
+ */
+static int esp_init_authenc(struct xfrm_state *x)
+{
+	struct crypto_aead *aead;
+	struct crypto_authenc_key_param *param;  //enckeylen
+	struct rtattr *rta;
+	char *key;
+	char *p;
+	char authenc_name[CRYPTO_MAX_ALG_NAME];
+	unsigned int keylen;
+	int err;
+	
+	err = -EINVAL;
+	if (!x->ealg)
+		goto error;
+	err = -ENAMETOOLONG;
+	
+	if ((x->props.flags & XFRM_STATE_ESN)) {  //Extended Sequence Number
+		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
+			     "%s%sauthencesn(%s,%s)%s",
+			     x->geniv ?: "", x->geniv ? "(" : "",
+			     x->aalg ? x->aalg->alg_name : "digest_null",
+			     x->ealg->alg_name,
+			     x->geniv ? ")" : "") >= CRYPTO_MAX_ALG_NAME)
+			goto error;
+	} else {
+		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
+			     "%s%sauthenc(%s,%s)%s",
+			     x->geniv ?: "", x->geniv ? "(" : "",
+			     x->aalg ? x->aalg->alg_name : "digest_null",
+			     x->ealg->alg_name,
+			     x->geniv ? ")" : "") >= CRYPTO_MAX_ALG_NAME)
+			goto error;
+	}
+	aead = crypto_alloc_aead(authenc_name, 0, 0);
+	err = PTR_ERR(aead);
+	if (IS_ERR(aead))
+		goto error;
+	x->data = aead; //private data
+	keylen = (x->aalg ? (x->aalg->alg_key_len + 7) / 8 : 0) +
+		 (x->ealg->alg_key_len + 7) / 8 + RTA_SPACE(sizeof(*param));
+	err = -ENOMEM;
+	key = kmalloc(keylen, GFP_KERNEL);
+	if (!key)
+		goto error;
+	p = key;
+	/*rtnetlink: macros :https://www.systutorials.com/docs/linux/man/3-rtnetlink/ */
+	rta = (void *)p;
+	rta->rta_type = CRYPTO_AUTHENC_KEYA_PARAM;
+	rta->rta_len = RTA_LENGTH(sizeof(*param));//returns the length which is required for len bytes of data plus the header.
+	param = RTA_DATA(rta); //returns a pointer to the start of this attribute's data. 
+	p += RTA_SPACE(sizeof(*param));//returns the amount of space which will be needed in a message with len bytes of data.  
+	if (x->aalg) {
+		struct xfrm_algo_desc *aalg_desc;
+
+		memcpy(p, x->aalg->alg_key, (x->aalg->alg_key_len + 7) / 8);
+		p += (x->aalg->alg_key_len + 7) / 8;
+
+		aalg_desc = xfrm_aalg_get_byname(x->aalg->alg_name, 0); //Get aalg name 
+		BUG_ON(!aalg_desc);
+
+		err = -EINVAL;
+		if (aalg_desc->uinfo.auth.icv_fullbits / 8 !=
+		    crypto_aead_authsize(aead)) {
+			pr_info("ESP: %s digestsize %u != %hu\n",
+				x->aalg->alg_name,
+				crypto_aead_authsize(aead),
+				aalg_desc->uinfo.auth.icv_fullbits / 8);
+			goto free_key;
+		}
+
+		err = crypto_aead_setauthsize(
+			aead, x->aalg->alg_trunc_len / 8);
+		if (err)
+			goto free_key;
+	}
+	param->enckeylen = cpu_to_be32((x->ealg->alg_key_len + 7) / 8);	
+	memcpy(p, x->ealg->alg_key, (x->ealg->alg_key_len + 7) / 8);
+
+	err = crypto_aead_setkey(aead, key, keylen); //setkey
+
+free_key:
+	kfree(key);
+
+error:
+	return err; 
+}
 
 /*ALIGN    :#define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
  *          #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
@@ -54,7 +196,7 @@ static void esp_destroy(struct xfrm_state *x)
  *          If you want to pass the value 4 (the alignment) instead of directly 
  *          0x03 (the alignment mask), you have the ALIGN macro
 */
-
+/*http://www.chronox.de/crypto-API/crypto/api-aead.html*/
 static int esp_init_state(struct xfrm_state *x)
 {
 	struct crypto_aead *aead;
@@ -63,7 +205,7 @@ static int esp_init_state(struct xfrm_state *x)
 	x->data = NULL;
 
 	if (x->aead)
-		err = esp_init_aead(x);
+		err = esp_init_aead(x);  //Authenticated Encryption With Associated Data (AEAD): The mostly type of encryption is GCM and CCM. 
 	else
 		err = esp_init_authenc(x);
 

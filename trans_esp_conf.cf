@@ -1,0 +1,24 @@
+# transport-esp-des-cbc-64-hmac-sha1.cf - Manual ipsec config file for transport-des-cbc-64-hmac-sha1
+
+
+spdflush;
+spdadd 192.168.10.1 192.168.10.2 any -P in ipsec
+        esp/transport//require ;
+
+spdadd 192.168.10.2 192.168.10.1 any -P out ipsec
+        esp/transport//require ;
+
+flush;
+
+add 192.168.10.1 192.168.10.2 esp 0x1000
+        -m transport
+        -E des-cbc "abcd1234"
+        -A hmac-sha1 "abcd1234abcd1234xyz1" ;
+
+add 192.168.10.2 192.168.10.1 esp 0x1001
+        -m transport
+        -E des-cbc "abcd1234"
+        -A hmac-sha1 "abcd1234abcd1234xyz1" ;
+
+##End
+

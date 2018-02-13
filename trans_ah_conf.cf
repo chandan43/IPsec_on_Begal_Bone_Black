@@ -1,0 +1,21 @@
+# transport-ah-3des-cbc-192-hmac-md5.cf - Manual ipsec config file for transport-3des-cbc-192-hmac-md5
+
+
+spdflush;
+spdadd 192.168.10.1 192.168.10.2 any -P in ipsec
+        ah/transport//require ;
+
+spdadd 192.168.10.2 192.168.10.1 any -P out ipsec
+        ah/transport//require ;
+
+flush;
+
+add 192.168.10.1 192.168.10.2 ah 0x201
+        -m transport
+        -A hmac-md5 "abcd1234abcd1234" ;
+
+add 192.168.10.2 192.168.10.1 ah 0x301
+        -m transport
+        -A hmac-md5 "abcd1234abcd1234" ;
+
+##End

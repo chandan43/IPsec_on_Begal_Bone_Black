@@ -1,4 +1,5 @@
-obj-m := esp4.o
+#obj-m := esp4.o
+obj-m := esp.o
 
 #CFLAGS_esp4.o := -DDEBUG
 
