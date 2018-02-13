@@ -42,6 +42,19 @@ static void esp_destroy(struct xfrm_state *x)
 
 }
 
+/*ALIGN    :#define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
+ *          #define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
+ *          #you have a number: 0x1006 
+ *          For some reasons you want to align it to a 4 bytes boundary.
+ *          With a 4-byte boundary, you know aligned values are 0x1000, 0x1004, 
+ *          0x1008, etc. You then also know the aligned value of 0x1006 is 0x1008.
+ *          How would you get 0x1008? The alignment mask for alignment value 4 is 
+ *          (4 - 1) = 0x03
+ *          Now 0x1006 + 0x03 = 0x1009 and 0x1009 & ~0x03 = 0x1008
+ *          If you want to pass the value 4 (the alignment) instead of directly 
+ *          0x03 (the alignment mask), you have the ALIGN macro
+*/
+
 static int esp_init_state(struct xfrm_state *x)
 {
 	struct crypto_aead *aead;
