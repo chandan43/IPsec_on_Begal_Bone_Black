@@ -22,14 +22,66 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	return 0;
 }
+
+/**
+ *	struct aead_request - AEAD request
+ *	@base: Common attributes for async crypto requests
+ *	@assoclen: Length in bytes of associated data for authentication
+ *	@cryptlen: Length of data to be encrypted or decrypted
+ *	@iv: Initialisation vector
+ *	@assoc: Associated data
+ *	@src: Source data
+ *	@dst: Destination data
+ *	@__ctx: Start of private context data
+ */
+/*
+ * Note: detecting truncated vs. non-truncated authentication data is very
+ * expensive, so we only support truncated data, which is the recommended
+ * and common case.
+ */
 static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
 {
+	struct ip_esp_hdr *esph;
+	struct crypto_aead *aead = x->data;
+	struct aead_request *req;
+	struct sk_buff *trailer;
+	int ivlen = crypto_aead_ivsize(aead);
+	int elen = skb->len - sizeof(*esph) - ivlen;
+	int nfrags;
+	int assoclen;
+	int seqhilen;
+	__be32 *seqhi;
+	void *tmp;
+	u8 *iv;
+	struct scatterlist *sg;
+	int err = -EINVAL;
 	return 0;
 }
 
 static u32 esp4_get_mtu(struct xfrm_state *x, int mtu)
 {
-	return 0;
+	struct crypto_aead *aead = x->data;
+	u32 blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+	unsigned int net_adj;
+	
+	struct crypto_aead *aead = x->data;
+	u32 blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+	unsigned int net_adj;
+
+	switch (x->props.mode) {
+		case XFRM_MODE_TRANSPORT:
+		case XFRM_MODE_BEET:
+			net_adj = sizeof(struct iphdr);
+			break;
+		case XFRM_MODE_TUNNEL:
+			net_adj = 0;
+			break;
+		default:
+			BUG();
+	}
+
+	return ((mtu - x->props.header_len - crypto_aead_authsize(aead) -
+		 net_adj) & ~(blksize - 1)) + net_adj - 2;	
 }
 
 /*If you have grasped the concept of namespaces you may have 
@@ -60,10 +112,11 @@ static int esp4_err(struct sk_buff *skb, u32 info)
 		return 0;
 	//TODO
 	if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH)
-		ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_ESP, 0);
+		ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_ESP, 0); //used when no socket context is available
 	else
 		ipv4_redirect(skb, net, 0, 0, IPPROTO_ESP, 0);
-	xfrm_state_put(x);
+	
+	xfrm_state_put(x); // xfrm state destroy
 	
 	return 0;
 }
