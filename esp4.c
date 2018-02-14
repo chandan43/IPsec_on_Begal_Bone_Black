@@ -32,16 +32,54 @@ static u32 esp4_get_mtu(struct xfrm_state *x, int mtu)
 	return 0;
 }
 
+/*If you have grasped the concept of namespaces you may have 
+  at this point an intuitive idea of what a network namespace 
+  might offer. Network namespaces provide a brand-new network 
+  stack for all the processes within the namespace. That includes
+  network interfaces, routing tables and iptables rules.
+  https://blogs.igalia.com/dpino/2016/04/10/network-namespaces/
+*/
 static int esp4_err(struct sk_buff *skb, u32 info)
 {
+	struct net *net = dev_net(skb->dev);  //Net namespace inlines
+	const struct iphdr *iph = (const struct iphdr *)skb->data;
+	struct ip_esp_hdr *esph = (struct ip_esp_hdr *)(skb->data+(iph->ihl<<2)); //TODO
+	struct xfrm_state *x;
+	switch (icmp_hdr(skb)->type) {
+	case ICMP_DEST_UNREACH:                    /* Destination Unreachable      */
+		if (icmp_hdr(skb)->code != ICMP_FRAG_NEEDED)
+			return 0;
+	case ICMP_REDIRECT:          /* Redirect (change route) */
+		break;
+	default:
+		return 0;
+	}	
+	x = xfrm_state_lookup(net, skb->mark, (const xfrm_address_t *)&iph->daddr, //TODO
+			      esph->spi, IPPROTO_ESP, AF_INET);
+	if (!x)
+		return 0;
+	//TODO
+	if (icmp_hdr(skb)->type == ICMP_DEST_UNREACH)
+		ipv4_update_pmtu(skb, net, info, 0, 0, IPPROTO_ESP, 0);
+	else
+		ipv4_redirect(skb, net, 0, 0, IPPROTO_ESP, 0);
+	xfrm_state_put(x);
+	
 	return 0;
 }
 
 static void esp_destroy(struct xfrm_state *x)
 {
+	struct crypto_aead *aead = x->data;
 
+	if (!aead)
+		return;
+
+	crypto_free_aead(aead);
 }
-//TODO
+/* Supported aead framework : EX- gcm, gmac : which Can support for 
+   encapsulation  and authentication 
+*/ 
 static int esp_init_aead(struct xfrm_state *x)
 {
 	char aead_name[CRYPTO_MAX_ALG_NAME];
@@ -60,7 +98,7 @@ static int esp_init_aead(struct xfrm_state *x)
 	x->data = aead;
 
 	err = crypto_aead_setkey(aead, x->aead->alg_key,
-				 (x->aead->alg_key_len + 7) / 8);
+				 (x->aead->alg_key_len + 7) / 8);  //ALIGN 8 byte
 	if (err)
 		goto error;
 

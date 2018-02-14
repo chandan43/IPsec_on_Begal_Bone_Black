@@ -1,0 +1,12 @@
+# tunnel-esp-aes-gcm-128-null.cf - Manual ipsec config file for tunnel-aes-gcm-128-null
+
+spdflush;
+spdadd 15.0.0.2 16.0.0.2 any -P out ipsec
+         esp/tunnel/16.0.0.1-16.0.0.2/require ;
+
+add 16.0.0.1 16.0.0.2 esp 0x202
+        -m tunnel
+        -E aes-gcm-16 "abcd1234abcd1234qwer";
+
+##End
+
