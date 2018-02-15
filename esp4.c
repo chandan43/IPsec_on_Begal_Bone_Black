@@ -34,6 +34,125 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
  *	@dst: Destination data
  *	@__ctx: Start of private context data
  */
+
+/*
+  The job of pskb_may_pull is to make sure that the area pointed to by
+  skb->data contains a block of
+  data at least as big as the IP header, since each IP packet (fragments
+  included) must include a complete IP
+  header.When we receive a packet , the kernel will call the pkb_may_pull(),
+*/
+
+/*
+   Make sure that the data buffers attached to a socket buffer are writable. 
+   If they are not, private copies are made of the data buffers and the socket 
+   buffer is set to use these instead. If tailbits is given, make sure that there 
+   is space to write tailbits bytes of data beyond current end of socket buffer.
+   trailer will be set to point to the skb in which this space begins.
+   The number of scatterlist elements required to completely map the COW'd 
+   and extended socket buffer will be returned. 
+*/
+
+/*
+ * Allocate an AEAD request structure with extra space for SG and IV.
+ *
+ * For alignment considerations the IV is placed at the front, followed
+ * by the request and finally the SG list.
+ *
+ * TODO: Use spare space in skb for this where possible.
+ */
+/**
+ * sg_init_table - Initialize SG table
+ * @sgl:	   The SG table
+ * @nents:	   Number of entries in table
+ *
+ * Notes:
+ *   If this is part of a chained sg table, sg_mark_end() should be
+ *   used only on the last table part.
+ *
+ **/
+/**
+ *	skb_to_sgvec - Fill a scatter-gather list from a socket buffer
+ *	@skb: Socket buffer containing the buffers to be mapped
+ *	@sg: The scatter-gather list to map into
+ *	@offset: The offset into the buffer's contents to start mapping
+ *	@len: Length of buffer space to be mapped
+ *
+ *	Fill the specified scatter-gather list with mappings/pointers into a
+ *	region of the buffer space attached to a socket buffer.
+ */
+ /**
+ * aead_request_set_ad - set associated data information
+ * @req: request handle
+ * @assoclen: number of bytes in associated data
+ *
+ * Setting the AD information.  This function sets the length of
+ * the associated data.
+ */
+ /**
+ * aead_request_set_crypt - set data buffers
+ * @req: request handle
+ * @src: source scatter / gather list
+ * @dst: destination scatter / gather list
+ * @cryptlen: number of bytes to process from @src
+ * @iv: IV for the cipher operation which must comply with the IV size defined
+ *      by crypto_aead_ivsize()
+ *
+ * Setting the source data and destination data scatter / gather lists which
+ * hold the associated data concatenated with the plaintext or ciphertext. See
+ * below for the authentication tag.
+ *
+ * For encryption, the source is treated as the plaintext and the
+ * destination is the ciphertext. For a decryption operation, the use is
+ * reversed - the source is the ciphertext and the destination is the plaintext.
+ *
+ * For both src/dst the layout is associated data, plain/cipher text,
+ * authentication tag.
+ *
+ * The content of the AD in the destination buffer after processing
+ * will either be untouched, or it will contain a copy of the AD
+ * from the source buffer.  In order to ensure that it always has
+ * a copy of the AD, the user must copy the AD over either before
+ * or after processing.  Of course this is not relevant if the user
+ * is doing in-place processing where src == dst.
+ *
+ * IMPORTANT NOTE AEAD requires an authentication tag (MAC). For decryption,
+ *		  the caller must concatenate the ciphertext followed by the
+ *		  authentication tag and provide the entire data stream to the
+ *		  decryption operation (i.e. the data length used for the
+ *		  initialization of the scatterlist and the data length for the
+ *		  decryption operation is identical). For encryption, however,
+ *		  the authentication tag is created while encrypting the data.
+ *		  The destination buffer must hold sufficient space for the
+ *		  ciphertext and the authentication tag while the encryption
+ *		  invocation must only point to the plaintext data size. The
+ *		  following code snippet illustrates the memory usage
+ *		  buffer = kmalloc(ptbuflen + (enc ? authsize : 0));
+ *		  sg_init_one(&sg, buffer, ptbuflen + (enc ? authsize : 0));
+ *		  aead_request_set_crypt(req, &sg, &sg, ptbuflen, iv);
+ */
+ /**
+ * crypto_aead_decrypt() - decrypt ciphertext
+ * @req: reference to the ablkcipher_request handle that holds all information
+ *	 needed to perform the cipher operation
+ *
+ * Decrypt ciphertext data using the aead_request handle. That data structure
+ * and how it is filled with data is discussed with the aead_request_*
+ * functions.
+ *
+ * IMPORTANT NOTE The caller must concatenate the ciphertext followed by the
+ *		  authentication data / tag. That authentication data / tag
+ *		  must have the size defined by the crypto_aead_setauthsize
+ *		  invocation.
+ *
+ *
+ * Return: 0 if the cipher operation was successful; -EBADMSG: The AEAD
+ *	   cipher operation performs the authentication of the data during the
+ *	   decryption operation. Therefore, the function returns this error if
+ *	   the authentication of the ciphertext was unsuccessful (i.e. the
+ *	   integrity of the ciphertext or the associated data was violated);
+ *	   < 0 if an error occurred.
+ */
 /*
  * Note: detecting truncated vs. non-truncated authentication data is very
  * expensive, so we only support truncated data, which is the recommended
@@ -55,7 +174,74 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
 	u8 *iv;
 	struct scatterlist *sg;
 	int err = -EINVAL;
-	return 0;
+	if (!pskb_may_pull(skb, sizeof(*esph) + ivlen)) 
+		goto out;
+        if (elen <= 0)
+		goto out;
+         
+	err = skb_cow_data(skb, 0, &trailer);  // skb_cow_data — Check that a socket buffer's data buffers are writable 
+	if (err < 0)
+		goto out;
+
+	nfrags = err;
+
+	assoclen = sizeof(*esph);
+	seqhilen = 0;	
+
+	if (x->props.flags & XFRM_STATE_ESN) {
+		seqhilen += sizeof(__be32);
+		assoclen += seqhilen;
+	}
+	err = -ENOMEM;
+	tmp = esp_alloc_tmp(aead, nfrags, seqhilen); //TODO
+	if (!tmp)
+		goto out;
+	
+	ESP_SKB_CB(skb)->tmp = tmp;
+	seqhi = esp_tmp_seqhi(tmp);
+	iv = esp_tmp_iv(aead, tmp, seqhilen);
+	req = esp_tmp_req(aead, iv);
+	sg = esp_req_sg(aead, req);
+
+	skb->ip_summed = CHECKSUM_NONE;
+
+	esph = (struct ip_esp_hdr *)skb->data;
+	
+	/*
+	 Setting the callback function that is triggered once the cipher operation 
+         completes The callback function is registered with the aead_request handle 
+         and must comply with the following template 
+        */
+	aead_request_set_callback(req, 0, esp_input_done, skb); //set asynchronous callback function 
+
+	/* For ESN we move the header forward by 4 bytes to
+	 * accomodate the high bits.  We will move it back after
+	 * decryption.
+	 */
+	if ((x->props.flags & XFRM_STATE_ESN)) {
+		esph = (void *)skb_push(skb, 4);
+		*seqhi = esph->spi;
+		esph->spi = esph->seq_no;
+		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.input.hi);
+		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
+	}
+
+	sg_init_table(sg, nfrags);
+	skb_to_sgvec(skb, sg, 0, skb->len);
+
+	aead_request_set_crypt(req, sg, sg, elen + ivlen, iv); //set data buffers
+	aead_request_set_ad(req, assoclen); // set associated data information
+
+	//decrypt ciphertext
+	err = crypto_aead_decrypt(req);
+	if (err == -EINPROGRESS)
+		goto out;
+	if ((x->props.flags & XFRM_STATE_ESN))
+		esp_input_restore_header(skb); //TODO
+
+	err = esp_input_done2(skb, err); //TODO	
+out:
+	return err;	
 }
 
 static u32 esp4_get_mtu(struct xfrm_state *x, int mtu)
