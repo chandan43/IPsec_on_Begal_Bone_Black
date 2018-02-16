@@ -24,6 +24,139 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 }
 
 /**
+ *	skb_copy_bits - copy bits from skb to kernel buffer
+ *	@skb: source skb
+ *	@offset: offset in source
+ *	@to: destination buffer
+ *	@len: number of bytes to copy
+ *
+ *	Copy the specified number of bytes from the source skb to the
+ *	destination buffer.
+ *
+ *	CAUTION ! :
+ *		If its prototype is ever changed,
+ *		check arch/{*}/net/{*}.S files,
+ *		since it is called from BPF assembly code.
+ */
+/**
+ *	pskb_trim_unique - remove end from a paged unique (not cloned) buffer
+ *	@skb: buffer to alter
+ *	@len: new length
+ *
+ *	This is identical to pskb_trim except that the caller knows that
+ *	the skb is not cloned so we should never get an error due to out-
+ *	of-memory.
+ */
+ /* Removing data from the front of the buffer
+    The skb_pull() function logicially removes data from 
+    the start of a buffer returning the space to the headroom.  It 
+    increments the skb­>data  pointer and decrements the value of skb­>len
+    effectively removing data from the head of a buffer and returning it 
+    to the headroom.  It returns a pointer to the new start of data
+ */
+static int esp_input_done2(struct sk_buff *skb, int err)
+{
+	const struct iphdr *iph;
+	struct xfrm_state *x = xfrm_input_state(skb);
+	struct crypto_aead *aead = x->data;
+	int alen = crypto_aead_authsize(aead);
+	int hlen = sizeof(struct ip_esp_hdr) + crypto_aead_ivsize(aead);
+	int elen = skb->len - hlen;
+	int ihl;
+	u8 nexthdr[2];
+	int padlen;
+
+	kfree(ESP_SKB_CB(skb)->tmp);
+
+	if (unlikely(err))
+		goto out;
+
+	if (skb_copy_bits(skb, skb->len-alen-2, nexthdr, 2))
+		BUG();
+	
+	err = -EINVAL;
+	padlen = nexthdr[0];
+	if (padlen + 2 + alen >= elen)
+		goto out;
+
+	/* ... check padding bits here. Silly. :-) */
+
+	iph = ip_hdr(skb);
+	ihl = iph->ihl * 4;
+
+	if (x->encap) {
+		struct xfrm_encap_tmpl *encap = x->encap;
+		struct udphdr *uh = (void *)(skb_network_header(skb) + ihl);
+
+		/*
+		 * 1) if the NAT-T peer's IP or port changed then
+		 *    advertize the change to the keying daemon.
+		 *    This is an inbound SA, so just compare
+		 *    SRC ports.
+		 */
+		if (iph->saddr != x->props.saddr.a4 ||
+		    uh->source != encap->encap_sport) {
+			xfrm_address_t ipaddr;
+
+			ipaddr.a4 = iph->saddr;
+			km_new_mapping(x, &ipaddr, uh->source);
+
+			/* XXX: perhaps add an extra
+			 * policy check here, to see
+			 * if we should allow or
+			 * reject a packet from a
+			 * different source
+			 * address/port.
+			 */
+		}
+
+		/*
+		 * 2) ignore UDP/TCP checksums in case
+		 *    of NAT-T in Transport Mode, or
+		 *    perform other post-processing fixes
+		 *    as per draft-ietf-ipsec-udp-encaps-06,
+		 *    section 3.1.2
+		 */
+		if (x->props.mode == XFRM_MODE_TRANSPORT)
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+	}
+	
+	pskb_trim(skb, skb->len - alen - padlen - 2);
+	__skb_pull(skb, hlen);
+	if (x->props.mode == XFRM_MODE_TUNNEL)
+		skb_reset_transport_header(skb);
+	else
+		skb_set_transport_header(skb, -ihl);
+
+	err = nexthdr[1];
+
+	/* RFC4303: Drop dummy packets without any error */
+	if (err == IPPROTO_NONE)
+		err = -EINVAL;
+
+out:
+	return err;
+}
+static void esp_input_done(struct crypto_async_request *base, int err)
+{
+	struct sk_buff *skb = base->data;
+
+	xfrm_input_resume(skb, esp_input_done2(skb, err)); //TODO
+}
+
+static void esp_input_restore_header(struct sk_buff *skb)
+{
+	esp_restore_header(skb, 0); //TODO
+	__skb_pull(skb, 4);
+}
+static void esp_input_done_esn(struct crypto_async_request *base, int err)
+{
+	struct sk_buff *skb = base->data;
+
+	esp_input_restore_header(skb);
+	esp_input_done(base, err);
+}
+/**
  *	struct aead_request - AEAD request
  *	@base: Common attributes for async crypto requests
  *	@assoclen: Length in bytes of associated data for authentication
