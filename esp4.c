@@ -20,7 +20,84 @@
 
 static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 {
-	return 0;
+	int err;
+	struct ip_esp_hdr *esph;
+	struct crypto_aead *aead;
+	struct aead_request *req;
+	struct scatterlist *sg;
+	struct sk_buff *trailer;
+	void *tmp;
+	u8 *iv;
+	u8 *tail;
+	int blksize;
+	int clen;
+	int alen;
+	int plen;
+	int ivlen;
+	int tfclen;
+	int nfrags;
+	int assoclen;
+	int seqhilen;
+	__be32 *seqhi;
+	__be64 seqno;
+	
+	/* skb is pure payload to encrypt */
+
+	aead = x->data;
+	alen = crypto_aead_authsize(aead);
+	ivlen = crypto_aead_ivsize(aead);
+	
+	tfclen = 0;
+	/*Traffic Flow Confidentiality (TFC) Padding : rfc 4303 : https://doc.hcc-embedded.com/display/INICHEIPSECANDIKE/TFC+Padding*/
+	if (x->tfcpad) {
+		struct xfrm_dst *dst = (struct xfrm_dst *)skb_dst(skb);
+		u32 padto;
+
+		padto = min(x->tfcpad, esp4_get_mtu(x, dst->child_mtu_cached));
+		if (skb->len < padto)
+			tfclen = padto - skb->len;
+	}
+	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+	clen = ALIGN(skb->len + 2 + tfclen, blksize); // TODO
+	plen = clen - skb->len - tfclen; //TODO
+
+	err = skb_cow_data(skb, tfclen + plen + alen, &trailer);
+	
+	if (err < 0)
+		goto error;
+	nfrags = err;
+
+	assoclen = sizeof(*esph);
+	seqhilen = 0;
+	
+	if (x->props.flags & XFRM_STATE_ESN) {
+		seqhilen += sizeof(__be32);
+		assoclen += seqhilen;
+	}
+
+	tmp = esp_alloc_tmp(aead, nfrags, seqhilen);
+	if (!tmp) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	seqhi = esp_tmp_seqhi(tmp);
+	iv = esp_tmp_iv(aead, tmp, seqhilen);
+	req = esp_tmp_req(aead, iv);
+	sg = esp_req_sg(aead, req);
+
+	/* Fill padding... */
+	tail = skb_tail_pointer(trailer);
+	if (tfclen) {
+		memset(tail, 0, tfclen);
+		tail += tfclen;
+	}
+	do {
+		int i;
+		for (i = 0; i < plen - 2; i++)
+			tail[i] = i + 1;
+	} while (0);
+	###STOP## rfc 	
 }
 
 /**
