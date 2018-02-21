@@ -18,6 +18,114 @@
 #include <net/protocol.h>
 #include <net/udp.h>
 
+struct esp_skb_cb {
+	struct xfrm_skb_cb xfrm;
+	void *tmp;
+};
+
+#define ESP_SKB_CB(__skb) ((struct esp_skb_cb *)&((__skb)->cb[0]))
+
+static u32 esp4_get_mtu(struct xfrm_state *x, int mtu);
+
+/*
+ * Allocate an AEAD request structure with extra space for SG and IV.
+ *
+ * For alignment considerations the IV is placed at the front, followed
+ * by the request and finally the SG list.
+ *
+ * TODO: Use spare space in skb for this where possible.
+ */
+static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags, int seqhilen)
+{
+	unsigned int len;
+
+	len = seqhilen;
+
+	len += crypto_aead_ivsize(aead);
+
+	if (len) {
+		len += crypto_aead_alignmask(aead) &
+		       ~(crypto_tfm_ctx_alignment() - 1);
+		len = ALIGN(len, crypto_tfm_ctx_alignment());
+	}
+
+	len += sizeof(struct aead_request) + crypto_aead_reqsize(aead);
+	len = ALIGN(len, __alignof__(struct scatterlist));
+
+	len += sizeof(struct scatterlist) * nfrags;
+
+	return kmalloc(len, GFP_ATOMIC);
+}
+
+static inline __be32 *esp_tmp_seqhi(void *tmp)
+{
+	return PTR_ALIGN((__be32 *)tmp, __alignof__(__be32));
+}
+
+static inline u8 *esp_tmp_iv(struct crypto_aead *aead, void *tmp, int seqhilen)
+{
+	return crypto_aead_ivsize(aead) ?
+	       PTR_ALIGN((u8 *)tmp + seqhilen,
+			 crypto_aead_alignmask(aead) + 1) : tmp + seqhilen;
+}
+static inline struct aead_request *esp_tmp_req(struct crypto_aead *aead, u8 *iv)
+{
+	struct aead_request *req;
+
+	req = (void *)PTR_ALIGN(iv + crypto_aead_ivsize(aead),
+				crypto_tfm_ctx_alignment());
+	aead_request_set_tfm(req, aead);
+	return req;
+}
+
+static inline struct scatterlist *esp_req_sg(struct crypto_aead *aead,
+					     struct aead_request *req)
+{
+	return (void *)ALIGN((unsigned long)(req + 1) +
+			     crypto_aead_reqsize(aead),
+			     __alignof__(struct scatterlist));
+}
+
+static void esp_output_done(struct crypto_async_request *base, int err)
+{
+	struct sk_buff *skb = base->data;
+
+	kfree(ESP_SKB_CB(skb)->tmp);
+	xfrm_output_resume(skb, err);
+}
+
+/* Move ESP header back into place. */
+static void esp_restore_header(struct sk_buff *skb, unsigned int offset)
+{
+	struct ip_esp_hdr *esph = (void *)(skb->data + offset);
+	void *tmp = ESP_SKB_CB(skb)->tmp;
+	__be32 *seqhi = esp_tmp_seqhi(tmp);
+
+	esph->seq_no = esph->spi;
+	esph->spi = *seqhi;
+}
+
+static void esp_output_restore_header(struct sk_buff *skb)
+{
+	esp_restore_header(skb, skb_transport_offset(skb) - sizeof(__be32));
+}
+
+static void esp_output_done_esn(struct crypto_async_request *base, int err)
+{
+	struct sk_buff *skb = base->data;
+
+	esp_output_restore_header(skb);
+	esp_output_done(base, err);
+}
+/**
+ *	skb_push - add data to the start of a buffer
+ *	@skb: buffer to use
+ *	@len: amount of data to add
+ *
+ *	This function extends the used data area of the buffer at the buffer
+ *	start. If this would exceed the total buffer headroom the kernel will
+ *	panic. A pointer to the first byte of the extra data is returned.
+ */
 static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 {
 	int err;
@@ -97,7 +205,97 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 		for (i = 0; i < plen - 2; i++)
 			tail[i] = i + 1;
 	} while (0);
-	###STOP## rfc 	
+	tail[plen - 2] = plen - 2;
+	tail[plen - 1] = *skb_mac_header(skb);
+	pskb_put(skb, trailer, clen - skb->len + alen); //add data to the tail of a potentially fragmented buffer
+	skb_push(skb, -skb_network_offset(skb)); //add data to the start of a buffer
+	esph = ip_esp_hdr(skb);
+	*skb_mac_header(skb) = IPPROTO_ESP;
+	/* this is non-NULL only with UDP Encapsulation */
+	
+	/* this is non-NULL only with UDP Encapsulation */
+	if (x->encap) {
+		struct xfrm_encap_tmpl *encap = x->encap;
+		struct udphdr *uh;
+		__be32 *udpdata32;
+		__be16 sport, dport;
+		int encap_type;
+
+		spin_lock_bh(&x->lock);
+		sport = encap->encap_sport;
+		dport = encap->encap_dport;
+		encap_type = encap->encap_type;
+		spin_unlock_bh(&x->lock);
+
+		uh = (struct udphdr *)esph;
+		uh->source = sport;
+		uh->dest = dport;
+		uh->len = htons(skb->len - skb_transport_offset(skb));
+		uh->check = 0;
+
+		switch (encap_type) {
+		default:
+		case UDP_ENCAP_ESPINUDP:
+			esph = (struct ip_esp_hdr *)(uh + 1);
+			break;
+		case UDP_ENCAP_ESPINUDP_NON_IKE:
+			udpdata32 = (__be32 *)(uh + 1);
+			udpdata32[0] = udpdata32[1] = 0;
+			esph = (struct ip_esp_hdr *)(udpdata32 + 2);
+			break;
+		}
+
+		*skb_mac_header(skb) = IPPROTO_UDP;
+	}
+	esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.low);
+
+	aead_request_set_callback(req, 0, esp_output_done, skb); //TODO
+	
+	/* For ESN we move the header forward by 4 bytes to
+	 * accomodate the high bits.  We will move it back after
+	 * encryption.
+	 */
+	if ((x->props.flags & XFRM_STATE_ESN)) {
+		esph = (void *)(skb_transport_header(skb) - sizeof(__be32));
+		*seqhi = esph->spi;
+		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.hi);
+		aead_request_set_callback(req, 0, esp_output_done_esn, skb);
+	}
+	esph->spi = x->id.spi;
+	sg_init_table(sg, nfrags);
+	skb_to_sgvec(skb, sg,
+		     (unsigned char *)esph - skb->data,
+		     assoclen + ivlen + clen + alen);
+	aead_request_set_crypt(req, sg, sg, ivlen + clen, iv);
+	aead_request_set_ad(req, assoclen); //ADDED req
+	seqno = cpu_to_be64(XFRM_SKB_CB(skb)->seq.output.low +
+			    ((u64)XFRM_SKB_CB(skb)->seq.output.hi << 32));
+
+	memset(iv, 0, ivlen);
+	memcpy(iv + ivlen - min(ivlen, 8), (u8 *)&seqno + 8 - min(ivlen, 8),
+	       min(ivlen, 8));
+
+	ESP_SKB_CB(skb)->tmp = tmp;
+	err = crypto_aead_encrypt(req);
+	
+	switch (err) {
+	case -EINPROGRESS:
+		goto error;
+
+	case -EBUSY:
+		err = NET_XMIT_DROP;
+		break;
+
+	case 0:
+		if ((x->props.flags & XFRM_STATE_ESN))
+			esp_output_restore_header(skb);
+	}
+
+	kfree(tmp);
+
+error:
+	return err;
+ 
 }
 
 /**
